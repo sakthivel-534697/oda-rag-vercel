@@ -1,0 +1,9 @@
+{
+  "name": "oda-rag-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.9.0",
+    "node-fetch": "^2.7.0"
+  }
+}
