@@ -1,79 +1,73 @@
-"use strict";
-const fetch = require("node-fetch");
-const { QdrantClient } = require("@qdrant/js-client-rest");
+'use strict';
+const fetch = require('node-fetch');
 
-const QDRANT_URL = process.env.QDRANT_URL;
+const QDRANT_URL = (process.env.QDRANT_URL || '').replace(/\/+$/, '');
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
-const HF_TOKEN = process.env.HF_TOKEN;
 const COLLECTION_NAME = "enterprise_knowledge";
-
-// Generates 384-dimensional vector embeddings using Hugging Face router
-async function getEmbedding(text) {
-  const url =
-    "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction";
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${HF_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-  });
-
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`HF Embedding error (${res.status}): ${errorText}`);
-  }
-
-  const data = await res.json();
-  // Handle nested output if returned as [[...]]
-  return Array.isArray(data[0]) ? data[0] : data;
-}
+const MODEL_NAME = "sentence-transformers/all-minilm-l6-v2";
 
 module.exports = async (req, res) => {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method Not Allowed" });
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
   const { docs } = req.body || {};
   if (!Array.isArray(docs) || docs.length === 0) {
-    return res
-      .status(400)
-      .json({ error: 'Body must contain a non-empty "docs" array' });
+    return res.status(400).json({ error: 'Body must contain a non-empty "docs" array' });
   }
 
   try {
-    const client = new QdrantClient({
-      url: QDRANT_URL,
-      apiKey: QDRANT_API_KEY,
+    // 1. Verify or create collection with 384 dimensions
+    const checkRes = await fetch(`${QDRANT_URL}/collections/${COLLECTION_NAME}`, {
+      headers: { 'api-key': QDRANT_API_KEY }
     });
 
-    // Initialize collection if not yet created
-    const collections = await client.getCollections();
-    const exists = collections.collections.some(
-      (c) => c.name === COLLECTION_NAME,
-    );
-    if (!exists) {
-      await client.createCollection(COLLECTION_NAME, {
-        vectors: { size: 384, distance: "Cosine" },
+    if (checkRes.status === 404) {
+      const createRes = await fetch(`${QDRANT_URL}/collections/${COLLECTION_NAME}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': QDRANT_API_KEY
+        },
+        body: JSON.stringify({
+          vectors: { size: 384, distance: 'Cosine' }
+        })
       });
+      if (!createRes.ok) {
+        const errJson = await createRes.json();
+        throw new Error(`Failed to create collection: ${JSON.stringify(errJson)}`);
+      }
     }
 
-    const points = [];
-    for (let i = 0; i < docs.length; i++) {
-      const text = docs[i].text;
-      if (!text) continue;
+    // 2. Format points using Qdrant Cloud Inference Object
+    const points = docs.map((doc, i) => ({
+      id: Date.now() + i,
+      vector: {
+        text: doc.text,
+        model: MODEL_NAME
+      },
+      payload: {
+        text: doc.text,
+        ...(doc.metadata || {})
+      }
+    }));
 
-      const vector = await getEmbedding(text);
-      points.push({
-        id: Date.now() + i,
-        vector: vector,
-        payload: { text: text, ...(docs[i].metadata || {}) },
-      });
+    // 3. Upsert points into Qdrant Cloud
+    const upsertRes = await fetch(`${QDRANT_URL}/collections/${COLLECTION_NAME}/points?wait=true`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': QDRANT_API_KEY
+      },
+      body: JSON.stringify({ points })
+    });
+
+    const resultData = await upsertRes.json();
+    if (!upsertRes.ok) {
+      throw new Error(`Qdrant upsert failed: ${JSON.stringify(resultData)}`);
     }
 
-    await client.upsert(COLLECTION_NAME, { points });
-    return res.status(200).json({ status: "success", count: points.length });
+    return res.status(200).json({ status: 'success', count: points.length });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
